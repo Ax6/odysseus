@@ -437,7 +437,13 @@ class RemoteControlManager:
                 await reply(f"Unknown command: /{command}\n\n{self._help_text()}")
                 return
             else:
-                mode = "chat"
+                # Default remote messages to agent mode so tools (calendar,
+                # notes, email, …) are always available — matching the web UI's
+                # agent mode. Relying on chat→agent intent escalation here was
+                # fragile: small models in plain chat mode just answer from
+                # training (and hallucinate the date) instead of calling tools.
+                # Use /chat to force a plain, tool-less turn.
+                mode = "agent"
                 prompt = text
 
             await typing()
@@ -463,9 +469,9 @@ class RemoteControlManager:
             "/reset - start a fresh remote chat session\n"
             "/tasks - list active scheduled tasks\n"
             "/run <task-id> - run a scheduled task now\n"
-            "/chat <message> - send a plain chat turn\n"
+            "/chat <message> - send a plain chat turn (no tools)\n"
             "/agent <message> - send an agent turn with tools\n"
-            "Otherwise, send a message and Odysseus auto-routes chat vs tool requests."
+            "Otherwise, plain messages run in agent mode with tools (calendar, notes, email, …)."
         )
 
     def _status_text(self) -> str:
