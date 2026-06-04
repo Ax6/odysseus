@@ -150,3 +150,52 @@ async def test_dispatch_uses_chat_stream_front_door(tmp_path):
     assert seen["form"]["message"] == "What calander entries do I have?"
     assert seen["form"]["mode"] == "chat"
     assert seen["form"]["remote_provider"] == "telegram"
+
+
+@pytest.mark.asyncio
+async def test_plain_message_defaults_to_agent_mode(tmp_path):
+    """Plain remote messages must run in agent mode so tools are available;
+    /chat forces a plain tool-less turn. (Regression: messages used to default
+    to chat mode and the model answered from training without calling tools.)"""
+    manager = RemoteControlManager(
+        session_manager=FakeSessionManager(),
+        task_scheduler=FakeTaskScheduler(),
+        auth_manager=FakeAuthManager(),
+        data_file=str(tmp_path / "remote_control.json"),
+    )
+    dispatched = []
+
+    async def fake_dispatch(surface_id, actor_id, prompt, mode):
+        dispatched.append({"prompt": prompt, "mode": mode})
+        return "ok"
+
+    manager._dispatch_to_chat_front_door = fake_dispatch
+
+    async def reply(_):
+        pass
+
+    async def typing():
+        pass
+
+    # Plain message → agent mode (tools available)
+    await manager._handle_message(
+        surface_id="telegram:1", actor_id="1",
+        text="what's in my calendar for today",
+        reply=reply, typing=typing, identity_text="",
+    )
+    # /chat → plain chat mode (no tools)
+    await manager._handle_message(
+        surface_id="telegram:1", actor_id="1",
+        text="/chat just say hi",
+        reply=reply, typing=typing, identity_text="",
+    )
+    # /agent → agent mode
+    await manager._handle_message(
+        surface_id="telegram:1", actor_id="1",
+        text="/agent do the thing",
+        reply=reply, typing=typing, identity_text="",
+    )
+
+    assert dispatched[0] == {"prompt": "what's in my calendar for today", "mode": "agent"}
+    assert dispatched[1] == {"prompt": "just say hi", "mode": "chat"}
+    assert dispatched[2] == {"prompt": "do the thing", "mode": "agent"}
