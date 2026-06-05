@@ -548,6 +548,31 @@ class RemoteControlManager:
         ok = await self.task_scheduler.run_task_now(task_id)
         return f"Started task {task_id}." if ok else f"Task {task_id} is already running."
 
+    def _persist_session_endpoint(self, session_id: str, endpoint_url: str, model: str) -> None:
+        """Write endpoint/model onto the session's DB row.
+
+        The session manager runs sync_session_metadata() on every get_session()
+        read, which overwrites the in-memory session.model/endpoint_url from the
+        DB. So setting them only in memory here is clobbered the moment
+        /api/chat_stream re-reads the session — which pinned remote chats to the
+        model they were CREATED with (changing the default only took effect
+        after /reset spawned a fresh session). Persisting to the DB row makes
+        the current default apply on every message. Best-effort: never let a DB
+        hiccup break message dispatch.
+        """
+        try:
+            from core.database import Session as DbSession, SessionLocal
+            db = SessionLocal()
+            try:
+                db.query(DbSession).filter(DbSession.id == session_id).update(
+                    {"endpoint_url": endpoint_url, "model": model}
+                )
+                db.commit()
+            finally:
+                db.close()
+        except Exception as exc:
+            logger.warning("Failed to persist remote session endpoint/model: %s", exc)
+
     async def _dispatch_to_chat_front_door(
         self,
         surface_id: str,
@@ -562,6 +587,10 @@ class RemoteControlManager:
         if not endpoint_url or not model:
             return "No default chat model is configured. Set one in Settings > AI."
         session = self._get_or_create_session(surface_id, owner, endpoint_url, model)
+        # Persist to the DB row, else the session manager's per-read metadata
+        # sync clobbers these back to the session's stored values (see
+        # _persist_session_endpoint) — pinning the model until /reset.
+        self._persist_session_endpoint(session.id, endpoint_url, model)
         session.endpoint_url = endpoint_url
         session.model = model
         form_data = {
