@@ -85,6 +85,11 @@ DEFAULT_SETTINGS = {
     "research_search_provider": "",
     "research_max_tokens": 16384,
     "research_extraction_timeout_seconds": 90,
+    # Lightweight planning/query LLM calls happen before any search starts.
+    # Keep them separately tunable so slow local backends are not capped by
+    # the old 30s/60s per-call defaults.
+    "research_planning_timeout_seconds": 90,
+    "research_query_timeout_seconds": 90,
     "research_extraction_concurrency": 3,
     # Hard wall-clock cap on a single deep-research run. The previous 600s
     # (10 min) default cut off slow local / edge LLMs mid-synthesis; 1800s
@@ -95,6 +100,7 @@ DEFAULT_SETTINGS = {
     # Tune via Settings or by editing data/settings.json.
     "research_run_timeout_seconds": 1800,
     "agent_max_tool_calls": 0,
+    "agent_max_rounds": 20,  # per-message agent step cap (clamped 1..200)
     "agent_input_token_budget": 6000,
     # Ceiling on the *auto-derived* input budget that #1230 introduced. Has
     # no effect when `agent_input_token_budget` is explicitly set (the user's
@@ -184,8 +190,10 @@ def load_settings() -> dict:
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             saved = json.load(f)
+        if not isinstance(saved, dict):
+            raise ValueError("settings must be an object")
         merged = {**DEFAULT_SETTINGS, **saved}
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, PermissionError, json.JSONDecodeError, ValueError):
         merged = dict(DEFAULT_SETTINGS)
     _settings_cache = (now, merged)
     return merged
@@ -213,7 +221,8 @@ def is_setting_overridden(key: str) -> bool:
     """
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            return key in json.load(f)
+            saved = json.load(f)
+        return isinstance(saved, dict) and key in saved
     except (FileNotFoundError, json.JSONDecodeError):
         return False
 
@@ -264,8 +273,10 @@ def load_features() -> dict:
     try:
         with open(FEATURES_FILE, "r", encoding="utf-8") as f:
             saved = json.load(f)
+        if not isinstance(saved, dict):
+            raise ValueError("features must be an object")
         merged = {**DEFAULT_FEATURES, **saved}
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
         merged = dict(DEFAULT_FEATURES)
     _features_cache = (now, merged)
     return merged
