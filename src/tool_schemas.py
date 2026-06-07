@@ -584,7 +584,7 @@ FUNCTION_TOOL_SCHEMAS = [
                     "label": {"type": "string", "description": "Optional category label (also used as a list filter)"},
                     "pinned": {"type": "boolean", "description": "Pin the note to the top"},
                     "archived": {"type": "boolean", "description": "For update: archive/unarchive. For list: show archived notes when true."},
-                    "due_date": {"type": "string", "description": "Reminder time. Accepts natural language ('tomorrow at 9am', '11pm today') or ISO 8601. Fires a notification at that time."},
+                    "due_date": {"type": "string", "description": "Reminder time. Accepts natural language ('tomorrow at 9am', 'today at 11pm') or ISO 8601. Fires a notification at that time."},
                     "index": {"type": "integer", "description": "Checklist item index (for toggle_item, 0-based)"}
                 },
                 "required": ["action"]
