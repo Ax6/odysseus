@@ -2,7 +2,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
-from src.remote_control import RemoteControlManager
+from src.telegram_control import TelegramControlManager
 
 
 class FakeAPIKeyManager:
@@ -51,7 +51,7 @@ class FakeTaskScheduler:
 
 @pytest.mark.asyncio
 async def test_provider_update_encrypts_and_masks_token(tmp_path):
-    manager = RemoteControlManager(
+    manager = TelegramControlManager(
         session_manager=FakeSessionManager(),
         task_scheduler=FakeTaskScheduler(),
         auth_manager=FakeAuthManager(),
@@ -76,7 +76,7 @@ async def test_provider_update_encrypts_and_masks_token(tmp_path):
 
 
 def test_allowlists_default_to_denied(tmp_path):
-    manager = RemoteControlManager(
+    manager = TelegramControlManager(
         session_manager=FakeSessionManager(),
         task_scheduler=FakeTaskScheduler(),
         auth_manager=FakeAuthManager(),
@@ -88,7 +88,7 @@ def test_allowlists_default_to_denied(tmp_path):
 
 @pytest.mark.asyncio
 async def test_reset_clears_provider_config(tmp_path):
-    manager = RemoteControlManager(
+    manager = TelegramControlManager(
         session_manager=FakeSessionManager(),
         task_scheduler=FakeTaskScheduler(),
         auth_manager=FakeAuthManager(),
@@ -129,7 +129,7 @@ async def test_dispatch_uses_chat_stream_front_door(tmp_path):
 
         return StreamingResponse(events(), media_type="text/event-stream")
 
-    manager = RemoteControlManager(
+    manager = TelegramControlManager(
         session_manager=FakeSessionManager(),
         task_scheduler=FakeTaskScheduler(),
         auth_manager=FakeAuthManager(),
@@ -138,14 +138,20 @@ async def test_dispatch_uses_chat_stream_front_door(tmp_path):
     )
     manager._resolve_chat_endpoint = lambda owner: ("http://model/chat/completions", "model", {})
 
-    reply = await manager._dispatch_to_chat_front_door(
+    sent = []
+
+    async def reply(msg):
+        sent.append(msg)
+
+    await manager._dispatch_to_chat_front_door(
         "telegram:8666203886",
         "8666203886",
         "What calander entries do I have?",
         "chat",
+        reply=reply,
     )
 
-    assert reply == "Calendar works"
+    assert sent == ["Calendar works"]
     assert seen["owner"] == "ken"
     assert seen["form"]["message"] == "What calander entries do I have?"
     assert seen["form"]["mode"] == "chat"
@@ -153,11 +159,53 @@ async def test_dispatch_uses_chat_stream_front_door(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_splits_messages_on_tool_calls(tmp_path):
+    """A multi-step agent turn should arrive as separate Telegram messages —
+    the narration before each tool call is flushed when the tool starts, and
+    the final answer is flushed at the end. Reasoning (thinking:true) is never
+    sent."""
+    app = FastAPI()
+
+    @app.post("/api/chat_stream")
+    async def chat_stream(request: Request):
+        async def events():
+            yield 'data: {"delta":"Let me check the light."}\n\n'
+            yield 'data: {"delta":"ignored","thinking":true}\n\n'
+            yield 'data: {"type":"tool_start","tool":"api_call"}\n\n'
+            yield 'data: {"delta":"It is off now."}\n\n'
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(events(), media_type="text/event-stream")
+
+    manager = TelegramControlManager(
+        session_manager=FakeSessionManager(),
+        task_scheduler=FakeTaskScheduler(),
+        auth_manager=FakeAuthManager(),
+        app=app,
+        data_file=str(tmp_path / "remote_control.json"),
+    )
+    manager._resolve_chat_endpoint = lambda owner: ("http://model/chat/completions", "model", {})
+
+    sent = []
+
+    async def reply(msg):
+        sent.append(msg)
+
+    await manager._dispatch_to_chat_front_door(
+        "telegram:1", "1", "turn off the light", "agent", reply=reply,
+    )
+
+    # Two messages: narration before the tool, then the final answer. The
+    # thinking:true delta is excluded from both.
+    assert sent == ["Let me check the light.", "It is off now."]
+
+
+@pytest.mark.asyncio
 async def test_plain_message_defaults_to_agent_mode(tmp_path):
     """Plain remote messages must run in agent mode so tools are available;
     /chat forces a plain tool-less turn. (Regression: messages used to default
     to chat mode and the model answered from training without calling tools.)"""
-    manager = RemoteControlManager(
+    manager = TelegramControlManager(
         session_manager=FakeSessionManager(),
         task_scheduler=FakeTaskScheduler(),
         auth_manager=FakeAuthManager(),
@@ -165,9 +213,8 @@ async def test_plain_message_defaults_to_agent_mode(tmp_path):
     )
     dispatched = []
 
-    async def fake_dispatch(surface_id, actor_id, prompt, mode):
+    async def fake_dispatch(surface_id, actor_id, prompt, mode, *, reply=None, typing=None):
         dispatched.append({"prompt": prompt, "mode": mode})
-        return "ok"
 
     manager._dispatch_to_chat_front_door = fake_dispatch
 

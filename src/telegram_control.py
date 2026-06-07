@@ -8,9 +8,11 @@ only exposed through this manager.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
+import re
 import uuid
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -97,7 +99,69 @@ def _chunk_text(text: str, limit: int) -> List[str]:
     return chunks or ["(no response)"]
 
 
-class RemoteControlManager:
+# ---------------------------------------------------------------------------
+# Markdown -> Telegram HTML
+# ---------------------------------------------------------------------------
+# The chat pipeline emits web-oriented Markdown, but Telegram's sendMessage
+# renders only a small HTML subset (<b> <i> <u> <s> <code> <pre> <a>). We
+# translate the Markdown the model commonly produces and escape everything
+# else. This runs ONLY on outbound text — it never touches the saved
+# conversation or what the model sees next turn.
+
+# Leave headroom below Telegram's 4096-char hard limit for the HTML tags we add.
+TELEGRAM_SEND_CHUNK = 3500
+
+_MD_CODE_BLOCK_RE = re.compile(r"```[ \t]*[\w+-]*\n?(.*?)```", re.DOTALL)
+_MD_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+_MD_HEADING_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*$", re.MULTILINE)
+_MD_BULLET_RE = re.compile(r"^([ \t]*)[-*+][ \t]+", re.MULTILINE)
+_MD_BOLD_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", re.DOTALL)
+_MD_BOLD_US_RE = re.compile(r"__(?=\S)(.+?)(?<=\S)__", re.DOTALL)
+_MD_ITALIC_RE = re.compile(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])")
+_MD_ITALIC_US_RE = re.compile(r"(?<![\w_])_(?=\S)([^_\n]+?)(?<=\S)_(?![\w_])")
+
+
+def markdown_to_telegram_html(text: str) -> str:
+    """Convert the chat pipeline's Markdown to the HTML subset Telegram renders.
+
+    Code spans are stashed before escaping so their contents aren't re-formatted.
+    Internal anchor links (e.g. `[View note](#note-…)`) are dead in Telegram, so
+    they collapse to their label text.
+    """
+    text = text or ""
+    stash: List[str] = []
+
+    def _keep(fragment: str) -> str:
+        stash.append(fragment)
+        return f"\x00{len(stash) - 1}\x00"
+
+    # 1. Code first (don't escape/format inside it).
+    text = _MD_CODE_BLOCK_RE.sub(lambda m: _keep(f"<pre>{html.escape(m.group(1).rstrip())}</pre>"), text)
+    text = _MD_INLINE_CODE_RE.sub(lambda m: _keep(f"<code>{html.escape(m.group(1))}</code>"), text)
+    # 2. Escape stray < > & in the remaining literal text.
+    text = html.escape(text, quote=False)
+    # 3. Block + inline Markdown -> Telegram HTML.
+    text = _MD_HEADING_RE.sub(r"<b>\1</b>", text)
+    text = _MD_BULLET_RE.sub(r"\1• ", text)
+
+    def _link(m: "re.Match") -> str:
+        label, url = m.group(1), m.group(2)
+        if not re.match(r"https?://", url, re.IGNORECASE):
+            return label  # internal anchor / non-http -> label only
+        return f'<a href="{url}">{label}</a>'
+
+    text = _MD_LINK_RE.sub(_link, text)
+    text = _MD_BOLD_RE.sub(r"<b>\1</b>", text)
+    text = _MD_BOLD_US_RE.sub(r"<b>\1</b>", text)
+    text = _MD_ITALIC_RE.sub(r"<i>\1</i>", text)
+    text = _MD_ITALIC_US_RE.sub(r"<i>\1</i>", text)
+    # 4. Restore code spans.
+    text = re.sub(r"\x00(\d+)\x00", lambda m: stash[int(m.group(1))], text)
+    return text
+
+
+class TelegramControlManager:
     def __init__(
         self,
         *,
@@ -375,9 +439,26 @@ class RemoteControlManager:
         )
 
     async def _telegram_send(self, token: str, chat_id: str, text: str) -> None:
-        for chunk in _chunk_text(text, TELEGRAM_MAX_CHARS):
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        for chunk in _chunk_text(text, TELEGRAM_SEND_CHUNK):
+            html_chunk = markdown_to_telegram_html(chunk)
+            try:
+                r = await self._client().post(
+                    url,
+                    json={"chat_id": chat_id, "text": html_chunk, "parse_mode": "HTML"},
+                    timeout=20,
+                )
+                if r.is_success:
+                    continue
+                # Most likely an "can't parse entities" 400 from an edge-case
+                # conversion (e.g. a formatting span split across a chunk
+                # boundary). Resend this chunk as plain text so the user still
+                # gets the message rather than nothing.
+                logger.warning("Telegram HTML send failed (%s); retrying as plain text", r.status_code)
+            except Exception as exc:
+                logger.warning("Telegram send error (%s); retrying as plain text", exc)
             await self._client().post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
+                url,
                 json={"chat_id": chat_id, "text": chunk},
                 timeout=20,
             )
@@ -447,8 +528,9 @@ class RemoteControlManager:
                 prompt = text
 
             await typing()
-            response = await self._dispatch_to_chat_front_door(surface_id, actor_id, prompt, mode)
-            await reply(response)
+            await self._dispatch_to_chat_front_door(
+                surface_id, actor_id, prompt, mode, reply=reply, typing=typing,
+            )
         except Exception as exc:
             logger.exception("Telegram remote-control message failed")
             await reply(f"Remote control error: {type(exc).__name__}: {exc}")
@@ -573,19 +655,40 @@ class RemoteControlManager:
         except Exception as exc:
             logger.warning("Failed to persist remote session endpoint/model: %s", exc)
 
+    @staticmethod
+    def _clean_segment(text: str) -> str:
+        """Strip inline <think> blocks the way the chat save-path does, so a
+        segment matches what the web UI shows. Reasoning that arrives flagged
+        thinking:true is already dropped upstream; this catches models that
+        emit reasoning as inline tags in normal content."""
+        text = (text or "").strip()
+        if not text:
+            return ""
+        try:
+            from routes.chat_helpers import clean_thinking_for_save
+            return (clean_thinking_for_save(text)[0] or "").strip()
+        except Exception as exc:
+            logger.debug("remote reply thinking-cleanup skipped: %s", exc)
+            return text
+
     async def _dispatch_to_chat_front_door(
         self,
         surface_id: str,
         actor_id: str,
         prompt: str,
         mode: str,
-    ) -> str:
+        *,
+        reply: Callable[[str], Awaitable[None]],
+        typing: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
         if self.app is None:
-            return "Remote control is not attached to the Odysseus chat runtime."
+            await reply("Remote control is not attached to the Odysseus chat runtime.")
+            return
         owner = self._owner_for()
         endpoint_url, model, _headers = self._resolve_chat_endpoint(owner)
         if not endpoint_url or not model:
-            return "No default chat model is configured. Set one in Settings > AI."
+            await reply("No default chat model is configured. Set one in Settings > AI.")
+            return
         session = self._get_or_create_session(surface_id, owner, endpoint_url, model)
         # Persist to the DB row, else the session manager's per-read metadata
         # sync clobbers these back to the session's stored values (see
@@ -607,14 +710,30 @@ class RemoteControlManager:
             "X-Odysseus-Owner": owner or "",
         }
         transport = httpx.ASGITransport(app=self.app, client=("127.0.0.1", 0))
-        parts: List[str] = []
+        # Buffer the model's narration and flush it as its own Telegram message
+        # at each tool-call boundary, so a multi-step agent turn arrives as a
+        # sequence of updates ("checking…", "retrying…", final answer) instead
+        # of one silent blob at the end. This is purely outbound — the saved
+        # conversation is unaffected.
+        buffer: List[str] = []
+        sent_any = False
         last_error = ""
+
+        async def _flush() -> None:
+            nonlocal buffer, sent_any
+            segment = self._clean_segment("".join(buffer))
+            buffer = []
+            if segment:
+                await reply(segment)
+                sent_any = True
+
         timeout = httpx.Timeout(420.0, connect=10.0, write=10.0, pool=10.0)
         async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:7000", timeout=timeout) as client:
             async with client.stream("POST", "/api/chat_stream", data=form_data, headers=headers) as response:
                 if response.status_code >= 400:
                     body = await response.aread()
-                    return f"Remote chat request failed ({response.status_code}): {body.decode(errors='replace')[:500]}"
+                    await reply(f"Remote chat request failed ({response.status_code}): {body.decode(errors='replace')[:500]}")
+                    return
                 async for line in response.aiter_lines():
                     line = (line or "").strip()
                     if not line.startswith("data:"):
@@ -629,13 +748,28 @@ class RemoteControlManager:
                     except Exception:
                         continue
                     if data.get("delta"):
-                        parts.append(str(data.get("delta")))
+                        # Reasoning tokens arrive flagged thinking:true. The
+                        # chat pipeline excludes them from the saved reply
+                        # (chat_routes: `if not data.get("thinking")`), so the
+                        # web UI never shows them — mirror that here, otherwise
+                        # the model's chain-of-thought leaks into Telegram.
+                        if data.get("thinking"):
+                            continue
+                        buffer.append(str(data.get("delta")))
+                    elif data.get("type") == "tool_start":
+                        # The model just finished narrating and is about to act —
+                        # send what it said so far as its own message, then show
+                        # it's still working.
+                        await _flush()
+                        if typing is not None:
+                            await typing()
                     elif data.get("type") == "research_done":
-                        parts.append("Research finished in Odysseus.")
+                        buffer.append("Research finished in Odysseus.")
                     elif data.get("type") == "error":
                         last_error = str(data.get("error") or data.get("message") or data)
-        reply = "".join(parts).strip()
-        return reply or last_error or "(no response)"
+        await _flush()
+        if not sent_any:
+            await reply(last_error or "(no response)")
 
     def _resolve_chat_endpoint(self, owner: str) -> Tuple[Optional[str], Optional[str], Dict[str, str]]:
         url, model, headers = resolve_endpoint("default", owner=owner or None)

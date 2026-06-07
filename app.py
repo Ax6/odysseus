@@ -630,8 +630,8 @@ set_task_scheduler(task_scheduler)
 from routes.task_routes import setup_task_routes
 app.include_router(setup_task_routes(task_scheduler))
 
-from src.remote_control import RemoteControlManager
-remote_control_manager = RemoteControlManager(
+from src.telegram_control import TelegramControlManager
+telegram_control_manager = TelegramControlManager(
     session_manager=session_manager,
     task_scheduler=task_scheduler,
     auth_manager=auth_manager,
@@ -701,8 +701,8 @@ from routes.api_token_routes import setup_api_token_routes
 app.include_router(setup_api_token_routes())
 
 # Telegram remote control adapter
-from routes.remote_control_routes import setup_remote_control_routes
-app.include_router(setup_remote_control_routes(remote_control_manager, auth_manager))
+from routes.telegram_control_routes import setup_telegram_control_routes
+app.include_router(setup_telegram_control_routes(telegram_control_manager, auth_manager))
 
 logger.info("Webhook, API token, and remote control routes initialized")
 
@@ -885,7 +885,7 @@ async def _startup_event():
     app.state._startup_tasks = _startup_tasks
     if upload_cleanup_func:
         upload_cleanup_task = asyncio.create_task(upload_cleanup_func())
-    _startup_tasks.append(asyncio.create_task(remote_control_manager.start()))
+    _startup_tasks.append(asyncio.create_task(telegram_control_manager.start()))
     # Always-on monitor that auto-continues the agent when a background bash
     # job (#!bg) finishes — re-invokes the turn with the job output.
     try:
@@ -1111,9 +1111,9 @@ async def _shutdown_event():
         await webhook_manager.close()
     except Exception as e:
         logger.warning(f"Webhook manager shutdown error: {e}")
-    # Close remote-control adapters
+    # Close the Telegram control adapter
     try:
-        await remote_control_manager.close()
+        await telegram_control_manager.close()
     except Exception as e:
         logger.warning(f"Remote control shutdown error: {e}")
     # Disconnect all MCP servers
