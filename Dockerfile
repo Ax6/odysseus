@@ -4,8 +4,13 @@
 # the final image / Cookbook never has to compile the broken sdists. See
 # docker/build-realesrgan-wheels.sh for the full rationale.
 FROM python:3.14-slim AS realesrgan-wheels
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+COPY scripts/check_ca_trust.py /usr/local/bin/check-ca-trust.py
+RUN python /usr/local/bin/check-ca-trust.py --system
+COPY requirements-bootstrap.txt /tmp/requirements-bootstrap.txt
+RUN python -m pip install --no-cache-dir --require-hashes --only-binary=:all: --no-deps -r /tmp/requirements-bootstrap.txt \
+    && python /usr/local/bin/check-ca-trust.py --python
 COPY docker/build-realesrgan-wheels.sh /usr/local/bin/build-realesrgan-wheels.sh
 RUN bash /usr/local/bin/build-realesrgan-wheels.sh /wheels
 
@@ -18,24 +23,56 @@ FROM python:3.14-slim
 # launch inside Docker.
 # nodejs/npm provide npx for the built-in Browser MCP server.
 # chromium provides the actual browser binary used by that MCP server.
+# fontconfig + Noto CJK provide real fallback glyphs for multilingual pages;
+# Chromium otherwise renders Chinese/Japanese/Korean labels as empty boxes.
+# iproute2/iputils-ping/net-tools/dnsutils/nmap give Docker-hosted agents the
+# basic network inspection toolkit expected by local LAN/debugging tasks.
 # gosu lets the entrypoint drop privileges cleanly so signals still reach
 # uvicorn directly (no extra shell layer like `su`/`sudo` would add).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    bubblewrap \
     cmake \
     curl \
+    ca-certificates \
     git \
     nodejs \
     npm \
     chromium \
+    fontconfig \
+    fonts-noto-cjk \
     tmux \
     openssh-client \
+    iproute2 \
+    iputils-ping \
+    net-tools \
+    dnsutils \
+    nmap \
     gosu \
     libgl1 \
     libglib2.0-0t64 \
     libxcb1 \
     libmagic1 \
     && rm -rf /var/lib/apt/lists/*
+
+# Refresh both Python trust bundles before installing application dependencies.
+# System roots also serve web fetches, webhooks, curl, and Node's OpenSSL mode.
+COPY scripts/check_ca_trust.py /usr/local/bin/check-ca-trust.py
+RUN python /usr/local/bin/check-ca-trust.py --system
+COPY requirements-bootstrap.txt /tmp/requirements-bootstrap.txt
+RUN python -m pip install --no-cache-dir --require-hashes --only-binary=:all: --no-deps -r /tmp/requirements-bootstrap.txt \
+    && python /usr/local/bin/check-ca-trust.py --python
+ENV NODE_OPTIONS=--use-openssl-ca \
+    GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=/etc/ssl/certs/ca-certificates.crt
+
+# Chromium has a separate root store. Distrust the compromised intermediate
+# public keys explicitly, including cross-signs, without waiting for CRL updates.
+COPY docker/chromium-emudhra.json /etc/chromium/policies/managed/odysseus-emudhra.json
+
+# Private browser automation wrapper used by the native `private_browser` tool.
+# Chromium is installed above, so agent-browser can drive the existing browser
+# binary without paying `npx` startup/install overhead on each tool call.
+RUN npm install -g agent-browser@0.35.0 --omit=dev --loglevel=error
 
 # libgl1/libglib2.0-0t64/libxcb1 are runtime shared libs (libGL.so.1,
 # libglib-2.0/libgthread, libxcb.so.1) that opencv-python (cv2) loads. The
@@ -92,8 +129,15 @@ COPY --from=realesrgan-wheels /wheels/ /tmp/odysseus-wheels/
 RUN pip install --no-cache-dir --no-deps /tmp/odysseus-wheels/*.whl \
     && rm -rf /tmp/odysseus-wheels
 
+# Check gRPC's effective defaults after all Python dependencies are installed.
+# Its wheel can retain affected roots even when pip/certifi are current.
+RUN python /usr/local/bin/check-ca-trust.py --system --python --grpc
+
 # Copy app code
 COPY . .
+# Require the redistribution notices in the image build context.
+COPY licenses/ ./licenses/
+COPY THIRD_PARTY_PROVENANCE.json ACKNOWLEDGMENTS.md ./
 
 # Create data directory (mount a volume here for persistence)
 RUN mkdir -p data logs services/cache/search

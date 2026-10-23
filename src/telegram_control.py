@@ -704,11 +704,15 @@ class TelegramControlManager:
             "remote_surface_id": surface_id,
             "remote_actor_id": actor_id,
         }
-        from core.middleware import INTERNAL_TOOL_HEADER, INTERNAL_TOOL_TOKEN
-        headers = {
-            INTERNAL_TOOL_HEADER: INTERNAL_TOOL_TOKEN,
-            "X-Odysseus-Owner": owner or "",
-        }
+        # The chat allowlist authenticates a remote user message. Internal-tool
+        # requests are continuations with no authority to grant new tool access.
+        if not self.auth_manager:
+            await reply("Remote chat owner could not be authenticated.")
+            return
+        token = await asyncio.to_thread(self.auth_manager.create_session_trusted, owner)
+        if not token:
+            await reply("Remote chat owner could not be authenticated.")
+            return
         transport = httpx.ASGITransport(app=self.app, client=("127.0.0.1", 0))
         # Buffer the model's narration and flush it as its own Telegram message
         # at each tool-call boundary, so a multi-step agent turn arrives as a
@@ -728,48 +732,48 @@ class TelegramControlManager:
                 sent_any = True
 
         timeout = httpx.Timeout(420.0, connect=10.0, write=10.0, pool=10.0)
-        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:7000", timeout=timeout) as client:
-            async with client.stream("POST", "/api/chat_stream", data=form_data, headers=headers) as response:
-                if response.status_code >= 400:
-                    body = await response.aread()
-                    await reply(f"Remote chat request failed ({response.status_code}): {body.decode(errors='replace')[:500]}")
-                    return
-                async for line in response.aiter_lines():
-                    line = (line or "").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        break
-                    if not payload:
-                        continue
-                    try:
-                        data = json.loads(payload)
-                    except Exception:
-                        continue
-                    if data.get("delta"):
-                        # Reasoning tokens arrive flagged thinking:true. The
-                        # chat pipeline excludes them from the saved reply
-                        # (chat_routes: `if not data.get("thinking")`), so the
-                        # web UI never shows them — mirror that here, otherwise
-                        # the model's chain-of-thought leaks into Telegram.
-                        if data.get("thinking"):
+        try:
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://127.0.0.1:7000", timeout=timeout,
+                cookies={"odysseus_session": token},
+            ) as client:
+                async with client.stream("POST", "/api/chat_stream", data=form_data) as response:
+                    if response.status_code >= 400:
+                        body = await response.aread()
+                        await reply(f"Remote chat request failed ({response.status_code}): {body.decode(errors='replace')[:500]}")
+                        return
+                    async for line in response.aiter_lines():
+                        line = (line or "").strip()
+                        if not line.startswith("data:"):
                             continue
-                        buffer.append(str(data.get("delta")))
-                    elif data.get("type") == "tool_start":
-                        # The model just finished narrating and is about to act —
-                        # send what it said so far as its own message, then show
-                        # it's still working.
-                        await _flush()
-                        if typing is not None:
-                            await typing()
-                    elif data.get("type") == "research_done":
-                        buffer.append("Research finished in Odysseus.")
-                    elif data.get("type") == "error":
-                        last_error = str(data.get("error") or data.get("message") or data)
-        await _flush()
-        if not sent_any:
-            await reply(last_error or "(no response)")
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            break
+                        if not payload:
+                            continue
+                        try:
+                            data = json.loads(payload)
+                        except Exception:
+                            continue
+                        if data.get("delta"):
+                            # Reasoning tokens are excluded from saved replies
+                            # and must not leak into Telegram either.
+                            if data.get("thinking"):
+                                continue
+                            buffer.append(str(data.get("delta")))
+                        elif data.get("type") == "tool_start":
+                            await _flush()
+                            if typing is not None:
+                                await typing()
+                        elif data.get("type") == "research_done":
+                            buffer.append("Research finished in Odysseus.")
+                        elif data.get("type") == "error":
+                            last_error = str(data.get("error") or data.get("message") or data)
+            await _flush()
+            if not sent_any:
+                await reply(last_error or "(no response)")
+        finally:
+            await asyncio.to_thread(self.auth_manager.revoke_token, token)
 
     def _resolve_chat_endpoint(self, owner: str) -> Tuple[Optional[str], Optional[str], Dict[str, str]]:
         url, model, headers = resolve_endpoint("default", owner=owner or None)

@@ -1,5 +1,5 @@
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from src.telegram_control import TelegramControlManager
@@ -19,6 +19,12 @@ class FakeAuthManager:
     users = {
         "ken": {"is_admin": True},
     }
+
+    def create_session_trusted(self, username):
+        return f"session-for-{username}"
+
+    def revoke_token(self, token):
+        pass
 
 
 class FakeSession:
@@ -112,15 +118,33 @@ async def test_reset_clears_provider_config(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_uses_chat_stream_front_door(tmp_path):
+@pytest.mark.parametrize("http_error", [False, True])
+async def test_dispatch_uses_chat_stream_front_door(tmp_path, http_error):
+    from core.auth import AuthManager
+    from src.agent_runtime.authority import is_internal_tool_request, request_authority_for_http
+
+    auth = AuthManager(auth_path=str(tmp_path / "auth.json"))
+    auth.create_user("ken", "test-password", is_admin=True)
     app = FastAPI()
     seen = {}
+
+    @app.middleware("http")
+    async def authenticate(request, call_next):
+        request.state.current_user = auth.get_username_for_token(request.cookies.get("odysseus_session"))
+        return await call_next(request)
 
     @app.post("/api/chat_stream")
     async def chat_stream(request: Request):
         form = await request.form()
         seen["form"] = dict(form)
-        seen["owner"] = request.headers.get("X-Odysseus-Owner")
+        seen["owner"] = request.state.current_user
+        seen["internal"] = is_internal_tool_request(request)
+        seen["authority"] = request_authority_for_http(
+            request, "list files in the workspace", owner=request.state.current_user,
+            session_id=form["session"], workspace=str(tmp_path),
+        )
+        if http_error:
+            raise HTTPException(503, "Unavailable")
 
         async def events():
             yield 'data: {"delta":"Calendar "}\n\n'
@@ -132,7 +156,7 @@ async def test_dispatch_uses_chat_stream_front_door(tmp_path):
     manager = TelegramControlManager(
         session_manager=FakeSessionManager(),
         task_scheduler=FakeTaskScheduler(),
-        auth_manager=FakeAuthManager(),
+        auth_manager=auth,
         app=app,
         data_file=str(tmp_path / "remote_control.json"),
     )
@@ -151,8 +175,14 @@ async def test_dispatch_uses_chat_stream_front_door(tmp_path):
         reply=reply,
     )
 
-    assert sent == ["Calendar works"]
+    if http_error:
+        assert len(sent) == 1 and sent[0].startswith("Remote chat request failed (503)")
+    else:
+        assert sent == ["Calendar works"]
     assert seen["owner"] == "ken"
+    assert seen["internal"] is False
+    assert seen["authority"].grants
+    assert auth._sessions == {}
     assert seen["form"]["message"] == "What calander entries do I have?"
     assert seen["form"]["mode"] == "chat"
     assert seen["form"]["remote_provider"] == "telegram"
