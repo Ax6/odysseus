@@ -1,5 +1,5 @@
 # Keep the application version unchanged while correcting its independent trust.
-FROM docker.io/searxng/searxng:2026.9.25-12f8b6515@sha256:5286edb35782454ab8a102c5eff6b54bff745853191b46aeead95f225aa6dfb6 AS base
+FROM docker.io/searxng/searxng:2026.10.19-81371861f@sha256:5ed0323b5f5f8701264ef65e239a2bd83cb57098f2b971fa30bf79c06eeae271 AS base
 
 FROM base AS baseline-validation
 COPY docker/searxng/repair_trust.py docker/searxng/blocked-certificates.json docker/searxng/validate_image.py /opt/odysseus-trust/
